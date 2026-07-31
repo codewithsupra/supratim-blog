@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PostgreSQL Connection Pooling: What I Learned Building a Multi-Tenant SaaS - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">PostgreSQL Connection Pooling: What I Learned Building a Multi-Tenant SaaS</h1>
+<h3 class="date">July 14, 2026</h3>
+
+<p>When I started building ShipKit, I used <code>pg.Pool</code> with default settings and didn't think about it. Then I started load testing — 50 concurrent analysis requests, each reading multiple files from the GitHub API and writing results to Postgres — and the server started throwing <code>ECONNREFUSED</code> errors. I'd exhausted the connection pool.</p>
+
+<p>Here's what I learned fixing it.</p>
+
+<h2 id="the-default-trap">The default trap</h2>
+
+<p><code>pg.Pool</code> defaults to 10 max connections. PostgreSQL defaults to 100 max connections. On a free-tier database (Render, Supabase, Neon), you often get 20-25. Every time you call <code>pool.query()</code>, it checks out a connection, runs the query, and returns it. If all connections are checked out and a new query comes in, it waits. If it waits too long, it throws.</p>
+
+<p>The problem isn't usually the number of connections — it's how long each one is held. A slow query or a forgotten transaction holds a connection until it completes or times out.</p>
+
+<h2 id="the-fix">What actually fixed it</h2>
+
+<p>Three changes:</p>
+
+<p><strong>1. Set <code>max</code> based on your actual database limit, not a guess.</strong></p>
+
+<div class="highlight"><pre class="highlight"><code>const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
+</code></pre></div>
+
+<p>If your database allows 25 connections and you have one server instance, <code>max: 20</code> leaves headroom for migrations, admin queries, and your ORM's internal connections. With multiple server instances, divide accordingly.</p>
+
+<p><strong>2. Never hold connections across async boundaries without a transaction.</strong></p>
+
+<p>This is the subtle one. Consider:</p>
+
+<div class="highlight"><pre class="highlight"><code>// BAD: holds a connection while waiting on GitHub API
+const client = await pool.connect();
+const repo = await github.getRepoInfo(octokit, owner, name); // 500ms+ network call
+await client.query('INSERT INTO analyses ...', [repo.data]);
+client.release();
+</code></pre></div>
+
+<p>That GitHub API call takes 500ms-2s. During that time, a connection is checked out and idle. Under load, this drains the pool. Fix:</p>
+
+<div class="highlight"><pre class="highlight"><code>// GOOD: only hold the connection for the actual query
+const repo = await github.getRepoInfo(octokit, owner, name);
+await pool.query('INSERT INTO analyses ...', [repo.data]);
+</code></pre></div>
+
+<p>Use <code>pool.query()</code> (auto-checkout/release) for single queries. Only use <code>pool.connect()</code> when you need a transaction.</p>
+
+<p><strong>3. Add connection pool monitoring.</strong></p>
+
+<div class="highlight"><pre class="highlight"><code>setInterval(() => {
+  console.log({
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+  });
+}, 10000);
+</code></pre></div>
+
+<p>If <code>waitingCount</code> is consistently above 0, your pool is too small or your queries are too slow. If <code>idleCount</code> equals <code>totalCount</code> most of the time, your pool is oversized — each idle connection still consumes memory on the database server.</p>
+
+<h2 id="transactions">Transactions done right</h2>
+
+<p>When you do need a transaction, use a wrapper that guarantees release:</p>
+
+<div class="highlight"><pre class="highlight"><code>async function withTransaction(pool, fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Usage
+await withTransaction(pool, async (client) => {
+  const { rows } = await client.query(
+    'INSERT INTO analyses ... RETURNING id', [...]
+  );
+  await client.query(
+    'INSERT INTO reports (analysis_id) VALUES ($1)', [rows[0].id]
+  );
+});
+</code></pre></div>
+
+<p>The <code>finally</code> block ensures the connection is returned even if the function throws. Without it, a single unhandled error permanently leaks a connection from the pool.</p>
+
+<h2 id="pgbouncer">When to add PgBouncer</h2>
+
+<p>For a single-server app with under 100 concurrent users, <code>pg.Pool</code> is fine. When you scale to multiple server instances — say, 3 containers behind a load balancer — each running its own pool of 20, you're suddenly opening 60 connections to a database that might only allow 100. That's when you add PgBouncer in front of Postgres. It multiplexes hundreds of application connections over a smaller number of actual database connections. Render and Supabase offer this built-in.</p>
+
+<p>The key insight: connection pooling is not a performance optimization. It's a resource management strategy. Get it wrong and your app works perfectly at low load and falls over the moment real traffic arrives.</p>
+
+</section>
+</body>
+</html>

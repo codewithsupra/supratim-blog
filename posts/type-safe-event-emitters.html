@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Type-Safe Event Emitters in TypeScript - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">Type-Safe Event Emitters in TypeScript</h1>
+<h3 class="date">July 20, 2026</h3>
+
+<p>Node's <code>EventEmitter</code> is stringly typed. You emit <code>'data'</code> with a buffer and listen for <code>'dat'</code> with a callback expecting a string, and TypeScript won't say a word. This is fine for small scripts but becomes a real source of bugs in larger systems where events are the primary communication channel between components.</p>
+
+<p>Here's a pattern I use to make event emitters fully type-safe.</p>
+
+<h2 id="the-problem">The problem</h2>
+
+<p>Consider a monitoring system (like Pulse) where a checker emits events:</p>
+
+<div class="highlight"><pre class="highlight"><code>checker.emit('check:complete', { status: 200, responseTime: 45 });
+checker.emit('check:failed', { error: 'ETIMEDOUT' });
+checker.emit('incident:opened', { monitorId: 'abc', startedAt: new Date() });
+</code></pre></div>
+
+<p>With a plain <code>EventEmitter</code>, nothing stops you from emitting <code>'check:complet'</code> (typo) or passing <code>{ statusCode: 200 }</code> (wrong property name). The listener on the other end silently receives <code>undefined</code> fields.</p>
+
+<h2 id="the-solution">The solution: mapped types over an event map</h2>
+
+<p>Define your events as a type map — event name to payload type:</p>
+
+<div class="highlight"><pre class="highlight"><code>type CheckerEvents = {
+  'check:complete': { status: number; responseTime: number };
+  'check:failed': { error: string; code?: string };
+  'incident:opened': { monitorId: string; startedAt: Date };
+  'incident:resolved': { monitorId: string; duration: number };
+};
+</code></pre></div>
+
+<p>Then build a typed emitter interface using mapped types:</p>
+
+<div class="highlight"><pre class="highlight"><code>interface TypedEmitter&lt;Events extends Record&lt;string, unknown&gt;&gt; {
+  on&lt;K extends keyof Events&gt;(
+    event: K,
+    listener: (payload: Events[K]) =&gt; void
+  ): this;
+
+  emit&lt;K extends keyof Events&gt;(
+    event: K,
+    payload: Events[K]
+  ): boolean;
+
+  off&lt;K extends keyof Events&gt;(
+    event: K,
+    listener: (payload: Events[K]) =&gt; void
+  ): this;
+}
+</code></pre></div>
+
+<p>Now create your class:</p>
+
+<div class="highlight"><pre class="highlight"><code>import { EventEmitter } from 'events';
+
+class Checker extends (EventEmitter as {
+  new (): TypedEmitter&lt;CheckerEvents&gt;
+}) {
+  async runCheck(url: string) {
+    try {
+      const start = Date.now();
+      const res = await fetch(url);
+      this.emit('check:complete', {
+        status: res.status,
+        responseTime: Date.now() - start,
+      });
+    } catch (err) {
+      this.emit('check:failed', {
+        error: (err as Error).message,
+      });
+    }
+  }
+}
+</code></pre></div>
+
+<h2 id="what-you-get">What you get</h2>
+
+<p>With this pattern:</p>
+
+<ul>
+  <li><code>checker.emit('check:complet', ...)</code> — compile error, <code>'check:complet'</code> is not a key of <code>CheckerEvents</code></li>
+  <li><code>checker.emit('check:complete', { statusCode: 200 })</code> — compile error, <code>statusCode</code> doesn't exist on the payload type</li>
+  <li><code>checker.on('check:complete', (payload) => { ... })</code> — <code>payload</code> is inferred as <code>{ status: number; responseTime: number }</code></li>
+</ul>
+
+<p>Autocomplete works everywhere. Rename an event in the type map and every emit/listener that references it lights up red.</p>
+
+<h2 id="generic-version">A reusable generic version</h2>
+
+<p>You can extract the casting into a helper:</p>
+
+<div class="highlight"><pre class="highlight"><code>function createTypedEmitter&lt;
+  Events extends Record&lt;string, unknown&gt;
+&gt;(): TypedEmitter&lt;Events&gt; {
+  return new EventEmitter() as TypedEmitter&lt;Events&gt;;
+}
+
+const checker = createTypedEmitter&lt;CheckerEvents&gt;();
+checker.on('check:complete', (p) =&gt; {
+  console.log(p.responseTime); // number, fully typed
+});
+</code></pre></div>
+
+<h2 id="tradeoffs">Tradeoffs</h2>
+
+<p>The <code>as</code> cast is a lie — at runtime it's still a regular <code>EventEmitter</code> that accepts any string. The safety is purely at the type level. If you're mixing typed and untyped code (e.g., a library emits events you didn't declare), the types won't catch mismatches at the boundary.</p>
+
+<p>For most application code, where you own both the emitter and the listener, this is exactly the right tradeoff: zero runtime cost, full compile-time safety.</p>
+
+</section>
+</body>
+</html>

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Scaling Socket.io: Lessons from Building a Real-Time Dashboard - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">Scaling Socket.io: Lessons from Building a Real-Time Dashboard</h1>
+<h3 class="date">June 30, 2026</h3>
+
+<p>Pulse's dashboard updates in real time — when a monitored endpoint goes down, every user watching that monitor sees the status flip to red within seconds. Building this with Socket.io was straightforward. Making it not fall over was the interesting part.</p>
+
+<h2 id="rooms-not-broadcasts">Rooms, not broadcasts</h2>
+
+<p>The first version broadcast every check result to every connected client. With 10 users monitoring 50 endpoints each at 30-second intervals, that's 500 events per 30 seconds sent to every client — even if they're only looking at one monitor.</p>
+
+<p>The fix is rooms. Each monitor gets a room. Clients join the room when they open the detail view and leave when they navigate away:</p>
+
+<div class="highlight"><pre class="highlight"><code>// Server
+io.on('connection', (socket) => {
+  socket.on('monitor:subscribe', (monitorId) => {
+    socket.join(`monitor:${monitorId}`);
+  });
+
+  socket.on('monitor:unsubscribe', (monitorId) => {
+    socket.leave(`monitor:${monitorId}`);
+  });
+});
+
+// When a check completes, only notify watchers
+io.to(`monitor:${monitorId}`).emit('check:result', data);
+</code></pre></div>
+
+<p>Now each client only receives events for monitors they're actively viewing. Traffic dropped by ~95%.</p>
+
+<h2 id="reconnection">Reconnection strategy</h2>
+
+<p>Socket.io has built-in reconnection, but the defaults are aggressive — exponential backoff starting at 1 second, which means a client that loses connection hammers the server with reconnect attempts. On a server restart with 100 connected clients, you get a thundering herd.</p>
+
+<p>I added jitter:</p>
+
+<div class="highlight"><pre class="highlight"><code>const socket = io(serverUrl, {
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 30000,
+  randomizationFactor: 0.5,
+});
+</code></pre></div>
+
+<p>The <code>randomizationFactor</code> adds up to 50% random variance to each delay. Instead of 100 clients all reconnecting at exactly 1s, 2s, 4s, they spread across 0.5-1.5s, 1-3s, 2-6s. The server recovers gracefully.</p>
+
+<h2 id="state-sync">State synchronization on reconnect</h2>
+
+<p>When a client reconnects, it missed events. The dashboard might show "Up" when the endpoint has been down for 30 seconds. Socket.io doesn't replay missed events — it's not a message queue.</p>
+
+<p>The solution is a state sync on reconnect:</p>
+
+<div class="highlight"><pre class="highlight"><code>socket.on('connect', () => {
+  // Re-subscribe to rooms
+  activeMonitors.forEach((id) => {
+    socket.emit('monitor:subscribe', id);
+  });
+
+  // Fetch current state via REST
+  activeMonitors.forEach((id) => {
+    fetch(`/api/monitors/${id}/status`)
+      .then((res) => res.json())
+      .then((status) => updateUI(id, status));
+  });
+});
+</code></pre></div>
+
+<p>The REST call fetches the ground truth. From there, the socket picks up live updates. This dual approach — REST for state, WebSocket for deltas — is a pattern I use everywhere now.</p>
+
+<h2 id="memory-leaks">The silent memory leak</h2>
+
+<p>Socket.io listeners are EventEmitter listeners. If you add a listener in a React <code>useEffect</code> without cleaning it up, every re-render adds another listener. After 50 navigations, you have 50 listeners for the same event, each updating state and triggering re-renders that add more listeners.</p>
+
+<div class="highlight"><pre class="highlight"><code>// The leak
+useEffect(() => {
+  socket.on('check:result', handleResult);
+}, []); // no cleanup
+
+// The fix
+useEffect(() => {
+  socket.on('check:result', handleResult);
+  return () => {
+    socket.off('check:result', handleResult);
+  };
+}, []);
+</code></pre></div>
+
+<p>This is basic React cleanup, but with WebSockets the symptoms are subtle — the app works, it just gets progressively slower and the dashboard flickers as duplicate handlers fight over state.</p>
+
+<h2 id="multi-server">Multi-server: the Redis adapter</h2>
+
+<p>A single Socket.io server holds all connection state in memory. If you scale to two servers behind a load balancer, a client connected to server A won't receive events emitted from server B.</p>
+
+<p>The <code>@socket.io/redis-adapter</code> solves this. Both servers subscribe to a shared Redis pub/sub channel. When server A emits to a room, Redis broadcasts it to server B, which forwards it to its local clients in that room:</p>
+
+<div class="highlight"><pre class="highlight"><code>import { createAdapter } from '@socket.io/redis-adapter';
+import { createClient } from 'redis';
+
+const pubClient = createClient({ url: redisUrl });
+const subClient = pubClient.duplicate();
+await Promise.all([pubClient.connect(), subClient.connect()]);
+
+io.adapter(createAdapter(pubClient, subClient));
+</code></pre></div>
+
+<p>Three lines of setup and your Socket.io deployment scales horizontally. The tradeoff is a Redis dependency and ~1-5ms of additional latency per event (the pub/sub hop). For a monitoring dashboard where updates happen every 30 seconds, that's invisible.</p>
+
+<h2 id="takeaway">The takeaway</h2>
+
+<p>WebSockets are easy to add and hard to operate. The initial implementation — <code>io.emit('event', data)</code> — takes 10 minutes. The reconnection strategy, state sync, memory leak prevention, and multi-server coordination take 10 hours. Budget accordingly.</p>
+
+</section>
+</body>
+</html>

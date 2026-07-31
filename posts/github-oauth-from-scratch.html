@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Implementing GitHub OAuth from Scratch (No Passport) - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">Implementing GitHub OAuth from Scratch (No Passport)</h1>
+<h3 class="date">June 22, 2026</h3>
+
+<p>Every tutorial I found for GitHub OAuth in Node.js used Passport. Passport is fine, but it's a lot of abstraction for what is fundamentally three HTTP requests. For ShipKit, I implemented the OAuth 2.0 flow manually. It's ~60 lines of code and I understand every one of them.</p>
+
+<h2 id="the-flow">The flow</h2>
+
+<p>OAuth 2.0 authorization code flow has three steps:</p>
+
+<ol>
+  <li>Redirect the user to GitHub's authorization page</li>
+  <li>GitHub redirects back to your app with a <code>code</code></li>
+  <li>Your server exchanges that <code>code</code> for an <code>access_token</code></li>
+</ol>
+
+<p>That's it. Everything else is plumbing.</p>
+
+<h2 id="step-1">Step 1: The redirect</h2>
+
+<div class="highlight"><pre class="highlight"><code>router.get('/github', (req, res) => {
+  const params = new URLSearchParams({
+    client_id: config.github.clientId,
+    redirect_uri: `${config.serverUrl}/api/auth/github/callback`,
+    scope: 'repo read:user user:email',
+  });
+  res.redirect(
+    `https://github.com/login/oauth/authorize?${params}`
+  );
+});
+</code></pre></div>
+
+<p>The <code>scope</code> parameter controls what your app can access. <code>repo</code> gives read access to repositories (needed for code analysis). <code>read:user</code> and <code>user:email</code> give you the user's profile and email. Request the minimum scopes you need — users see this list and will bounce if it looks greedy.</p>
+
+<h2 id="step-2">Step 2: The callback</h2>
+
+<p>GitHub redirects to your callback URL with a <code>code</code> query parameter. Exchange it for an access token:</p>
+
+<div class="highlight"><pre class="highlight"><code>router.get('/github/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send('Missing code');
+
+  // Exchange code for access token
+  const tokenRes = await fetch(
+    'https://github.com/login/oauth/access_token',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: config.github.clientId,
+        client_secret: config.github.clientSecret,
+        code,
+      }),
+    }
+  );
+  const { access_token } = await tokenRes.json();
+</code></pre></div>
+
+<p>The <code>Accept: application/json</code> header is important — without it, GitHub returns the token as a URL-encoded string instead of JSON.</p>
+
+<h2 id="step-3">Step 3: Fetch the user</h2>
+
+<p>With the access token, fetch the user's profile and email:</p>
+
+<div class="highlight"><pre class="highlight"><code>  const userRes = await fetch('https://api.github.com/user', {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+  const githubUser = await userRes.json();
+
+  // Email might be private — fetch from the emails endpoint
+  const emailRes = await fetch('https://api.github.com/user/emails', {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+  const emails = await emailRes.json();
+  const primaryEmail = emails.find((e) => e.primary)?.email;
+</code></pre></div>
+
+<p>The <code>/user</code> endpoint returns the public profile, but the <code>email</code> field is often <code>null</code> if the user has set their email to private. The <code>/user/emails</code> endpoint returns all verified emails with a <code>primary</code> flag. You need the <code>user:email</code> scope for this.</p>
+
+<h2 id="upsert-and-jwt">Upsert and JWT</h2>
+
+<p>Now upsert the user in your database and create a session token:</p>
+
+<div class="highlight"><pre class="highlight"><code>  const user = await db.query(
+    `INSERT INTO users (github_id, username, email, avatar_url, access_token)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (github_id)
+     DO UPDATE SET username = $2, email = $3, avatar_url = $4, access_token = $5
+     RETURNING id, username, email, avatar_url`,
+    [githubUser.id, githubUser.login, primaryEmail,
+     githubUser.avatar_url, access_token]
+  );
+
+  const token = jwt.sign(
+    { userId: user.rows[0].id },
+    config.jwtSecret,
+    { expiresIn: '7d' }
+  );
+
+  res.redirect(`${config.clientUrl}/dashboard?token=${token}`);
+});
+</code></pre></div>
+
+<p>The <code>ON CONFLICT</code> clause handles returning users — if the <code>github_id</code> already exists, it updates their profile instead of throwing a duplicate key error. The JWT is passed to the client via a query parameter in the redirect. The client extracts it and stores it in memory (not localStorage — see below).</p>
+
+<h2 id="token-storage">Where to store the JWT</h2>
+
+<p>Three options, each with tradeoffs:</p>
+
+<ul>
+  <li><strong>localStorage</strong> — persists across tabs and page reloads, but vulnerable to XSS. Any JavaScript running on your page can read it.</li>
+  <li><strong>httpOnly cookie</strong> — immune to XSS (JavaScript can't access it), but you need CSRF protection and it's sent with every request to your domain.</li>
+  <li><strong>In-memory variable</strong> — immune to both XSS and CSRF, but lost on page refresh. The user has to re-authenticate.</li>
+</ul>
+
+<p>For ShipKit, I use in-memory storage with a short-lived JWT. If the page refreshes, the user re-authenticates through GitHub — and since they've already authorized the app, GitHub redirects back immediately without showing the authorization screen. The UX is a brief flash; the security posture is clean.</p>
+
+<h2 id="why-not-passport">Why not Passport</h2>
+
+<p>Passport is 600+ lines of code with a strategy pattern, session serialization, and middleware chaining. For a single OAuth provider, that's a lot of abstraction over three fetch calls. The manual implementation is easier to debug (no middleware chain to trace), easier to understand (no serialize/deserialize hooks), and has zero dependencies beyond what you already have.</p>
+
+<p>If you're integrating 5 OAuth providers with session management across multiple auth strategies, use Passport. If you're doing GitHub-only OAuth for a side project, the manual approach is ~60 lines and you'll actually understand what happens when something breaks.</p>
+
+</section>
+</body>
+</html>

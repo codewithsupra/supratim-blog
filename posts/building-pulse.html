@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Building Pulse: Real-Time API Monitoring with Node.js and WebSockets - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">Building Pulse: Real-Time API Monitoring with Node.js and WebSockets</h1>
+<h3 class="date">July 28, 2026</h3>
+
+<p>Pulse is an uptime monitoring platform I built to solve a problem I kept running into: I'd deploy a side project, forget about it, and discover weeks later that it had been down. The existing solutions were either expensive or overkill for what I needed — hit an endpoint every 30 seconds, tell me if it's down, show me the history.</p>
+
+<h2 id="the-architecture">The architecture</h2>
+
+<p>The system has three main components:</p>
+
+<ul>
+  <li><strong>Monitor scheduler</strong> — a loop that fires HTTP requests at configured intervals (30s, 1m, 5m) and records response time, status code, and any errors</li>
+  <li><strong>Real-time layer</strong> — Socket.io broadcasts status changes to connected dashboard clients the moment they happen, no polling</li>
+  <li><strong>Incident engine</strong> — detects downtime, tracks incident duration, and triggers notifications</li>
+</ul>
+
+<p>The backend is Express + MongoDB. I chose Mongo over Postgres here because the monitoring data is naturally document-shaped — each check is a self-contained record with variable metadata — and I wanted capped collections for automatic TTL on historical data.</p>
+
+<h2 id="real-time-updates">Real-time updates with Socket.io</h2>
+
+<p>The dashboard shows live status for all monitored endpoints. When a check completes, the server emits to the relevant room:</p>
+
+<div class="highlight"><pre class="highlight"><code>io.to(`monitor:${monitorId}`).emit('check:complete', {
+  status: response.status,
+  responseTime: elapsed,
+  timestamp: new Date()
+});
+</code></pre></div>
+
+<p>The client subscribes when you open a monitor's detail view and unsubscribes when you navigate away. This keeps the WebSocket traffic proportional to what you're actually looking at, not the total number of monitors.</p>
+
+<h2 id="the-monitoring-loop">The monitoring loop</h2>
+
+<p>The naive approach is <code>setInterval</code> per monitor. This falls apart at scale — 100 monitors with 30s intervals means 100 timers, and timer drift means checks bunch up and create traffic spikes.</p>
+
+<p>Instead I use a single scheduling loop that maintains a priority queue sorted by next-check time. Each tick, it pulls all monitors due for a check, fires them concurrently with <code>Promise.allSettled</code>, and re-inserts them with their next scheduled time:</p>
+
+<div class="highlight"><pre class="highlight"><code>while (queue.length && queue[0].nextCheck <= now) {
+  const monitor = queue.shift();
+  batch.push(checkEndpoint(monitor));
+  monitor.nextCheck = now + monitor.interval;
+  insertSorted(queue, monitor);
+}
+
+const results = await Promise.allSettled(batch);
+</code></pre></div>
+
+<p>This naturally distributes checks across time and handles slow responses without blocking the queue.</p>
+
+<h2 id="incident-detection">Incident detection</h2>
+
+<p>A single failed check doesn't trigger an incident — networks are flaky. Pulse uses a confirmation window: an endpoint must fail N consecutive checks before it's marked down. The default is 3, configurable per monitor.</p>
+
+<p>Once confirmed down, the incident stays open until a successful check comes back. The incident record tracks:</p>
+
+<ul>
+  <li>Start time (first failure in the confirmation window)</li>
+  <li>Confirmation time (when it crossed the threshold)</li>
+  <li>Resolution time (first successful check after the incident)</li>
+  <li>Total downtime duration</li>
+  <li>All individual check results during the incident</li>
+</ul>
+
+<h2 id="response-time-tracking">Response time visualization</h2>
+
+<p>The dashboard shows a sparkline of response times over the last 24 hours for each monitor. I store the raw check data and compute percentiles (p50, p95, p99) on read. For the sparkline, I downsample to 5-minute buckets using the average response time in each bucket — this keeps the chart readable without losing the shape of the data.</p>
+
+<h2 id="dev-experience">Development experience</h2>
+
+<p>One thing I'm proud of: in dev mode, Pulse auto-uses an in-memory MongoDB instance via <code>mongodb-memory-server</code>. No Docker, no local Mongo install, just <code>npm run dev</code> and it works. The server detects <code>NODE_ENV=development</code>, spins up the in-memory instance, and connects to it. Tests use the same mechanism — each test suite gets its own ephemeral database.</p>
+
+<h2 id="what-i-learned">What I learned</h2>
+
+<p>The biggest lesson was about WebSocket connection management. Early on I had a bug where navigating between pages in the SPA would subscribe to rooms without unsubscribing from the previous ones. After a few minutes of clicking around, the client was receiving duplicate events and the dashboard was flickering. The fix was straightforward — clean up subscriptions in the React effect cleanup — but it taught me to treat WebSocket lifecycle with the same care as database connections.</p>
+
+<p>Source on <a href="https://github.com/supratimsarkar">GitHub</a>.</p>
+
+</section>
+</body>
+</html>

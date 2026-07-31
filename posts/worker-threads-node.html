@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Using Worker Threads in Node.js for CPU-Intensive Analysis - Supratim Sarkar's Blog</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <section class="top" role="heading">
+      <header role="heading">
+        <h1>
+          <a href="/">Supratim Sarkar's Blog</a>
+        </h1>
+      </header>
+      <nav role="navigation">
+        <ul>
+          <li>
+            <a href="/about.html">About</a>
+          </li>
+        </ul>
+      </nav>
+    </section>
+    <section class="content" role="article">
+<h1 class="title">Using Worker Threads in Node.js for CPU-Intensive Analysis</h1>
+<h3 class="date">July 7, 2026</h3>
+
+<p>Node.js is single-threaded, which is fine until you need to do something CPU-intensive. In ShipKit, the security scanner runs regex patterns against every file in a repository. For a large repo with hundreds of files, this blocks the event loop for seconds — long enough to make other requests queue up and the health check endpoint time out.</p>
+
+<p><code>worker_threads</code> fixed this cleanly.</p>
+
+<h2 id="the-problem">The problem in numbers</h2>
+
+<p>The security scanner runs 8 regex patterns against each file's content. For a repo with 200 files averaging 5KB each, that's 1,600 regex executions over ~1MB of text. On a single thread, this takes 800ms-1.5s. During that time, every other request — including the Express health check — is blocked.</p>
+
+<p>In a monitoring context (Pulse hits <code>/health</code> every 30 seconds), a 1.5s block means occasional false downtime alerts. In a multi-user context, two concurrent analyses stack up to 3 seconds of total blocking.</p>
+
+<h2 id="worker-threads-basics">Worker threads basics</h2>
+
+<p>A worker thread runs JavaScript in a separate V8 isolate with its own event loop. It shares memory with the main thread only through explicit <code>SharedArrayBuffer</code> — otherwise, data is serialized (structured clone) when passed between threads.</p>
+
+<div class="highlight"><pre class="highlight"><code>// main.js
+const { Worker } = require('worker_threads');
+
+function analyzeInWorker(files) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('./scanner-worker.js', {
+      workerData: { files },
+    });
+    worker.on('message', resolve);
+    worker.on('error', reject);
+  });
+}
+</code></pre></div>
+
+<div class="highlight"><pre class="highlight"><code>// scanner-worker.js
+const { parentPort, workerData } = require('worker_threads');
+
+const patterns = [
+  { name: 'aws-key', regex: /AKIA[0-9A-Z]{16}/, severity: 'critical' },
+  { name: 'private-key', regex: /-----BEGIN (?:RSA )?PRIVATE KEY-----/, severity: 'critical' },
+  { name: 'github-token', regex: /ghp_[a-zA-Z0-9]{36}/, severity: 'critical' },
+  // ...
+];
+
+const findings = [];
+for (const file of workerData.files) {
+  for (const pattern of patterns) {
+    if (pattern.regex.test(file.content)) {
+      findings.push({
+        file: file.path,
+        type: pattern.name,
+        severity: pattern.severity,
+      });
+    }
+  }
+}
+
+parentPort.postMessage(findings);
+</code></pre></div>
+
+<p>The main thread stays responsive while the worker crunches through files.</p>
+
+<h2 id="worker-pool">Don't create a worker per request</h2>
+
+<p>Spawning a worker takes 30-50ms and allocates ~6MB for the new V8 isolate. If you create one per request, you're adding latency and memory overhead that erases the benefit of offloading.</p>
+
+<p>Use a worker pool instead:</p>
+
+<div class="highlight"><pre class="highlight"><code>class WorkerPool {
+  constructor(script, size) {
+    this.queue = [];
+    this.workers = Array.from({ length: size }, () => {
+      const worker = new Worker(script);
+      worker.busy = false;
+      worker.on('message', (result) => {
+        worker.busy = false;
+        worker.currentResolve(result);
+        this.drain();
+      });
+      return worker;
+    });
+  }
+
+  run(data) {
+    return new Promise((resolve) => {
+      this.queue.push({ data, resolve });
+      this.drain();
+    });
+  }
+
+  drain() {
+    if (!this.queue.length) return;
+    const idle = this.workers.find((w) => !w.busy);
+    if (!idle) return;
+    const { data, resolve } = this.queue.shift();
+    idle.busy = true;
+    idle.currentResolve = resolve;
+    idle.postMessage(data);
+  }
+}
+</code></pre></div>
+
+<p>Size the pool to the number of CPU cores minus one (leave the main thread a core). On a 4-core machine, that's 3 workers. On a single-core container (common on free tiers), a pool of 1 still helps — the worker runs on a separate V8 isolate, so the main thread's event loop stays unblocked even though they share the CPU.</p>
+
+<h2 id="when-not-to">When not to use worker threads</h2>
+
+<p>If the work is I/O-bound (database queries, HTTP requests, file reads), worker threads add complexity without benefit. Node's async I/O already handles this efficiently — the event loop doesn't block on I/O.</p>
+
+<p>Worker threads are for CPU-bound work: parsing, regex matching, hashing, image processing, compression. The rule of thumb: if the work takes more than 100ms of synchronous CPU time, move it to a worker. Under 100ms, the overhead of serialization and thread coordination isn't worth it.</p>
+
+<h2 id="structured-clone">Watch the serialization cost</h2>
+
+<p>Data passed to workers via <code>postMessage</code> is copied using the structured clone algorithm. If you're passing 10MB of file contents, that's 10MB of serialization and 10MB of deserialization. For large payloads, consider streaming the file paths and having the worker read them directly, or use <code>SharedArrayBuffer</code> for zero-copy sharing (with the caveat that you need to manage synchronization yourself via <code>Atomics</code>).</p>
+
+<p>For ShipKit's use case — a few hundred KB of file contents — structured clone is fine. The serialization overhead is negligible compared to the regex work.</p>
+
+</section>
+</body>
+</html>
