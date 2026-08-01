@@ -96,7 +96,7 @@ const results = await Promise.allSettled(batch);
 
 <p>The biggest lesson was about WebSocket connection management. Early on I had a bug where navigating between pages in the SPA would subscribe to rooms without unsubscribing from the previous ones. After a few minutes of clicking around, the client was receiving duplicate events and the dashboard was flickering. The fix was straightforward — clean up subscriptions in the React effect cleanup — but it taught me to treat WebSocket lifecycle with the same care as database connections.</p>
 
-<p>Source on <a href="https://github.com/supratimsarkar">GitHub</a>.</p>
+<p>Source on <a href="https://github.com/codewithsupra">GitHub</a>.</p>
 
 </section>
 </body>
